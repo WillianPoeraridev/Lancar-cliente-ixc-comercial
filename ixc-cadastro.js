@@ -298,9 +298,26 @@ async function cadastrarNoIXC(DADOS) {
   // ── CONTRATO ──
 
   console.log('➕ Clicando em Novo contrato...')
-  await waitFor('button[name=\"novo\"].fbutton')
-  await exec("document.querySelector('button[name=\"novo\"].fbutton').click()")
   await new Promise(r => setTimeout(r, 1000))
+  // IMPORTANTE: pega o Novo da GRID de contratos (div.tDiv2/gridActions), NÃO o do formulário principal
+  await exec(
+    "(function() {" +
+    "  var btn = null;" +
+    "  var gridBtns = document.querySelectorAll('div.tDiv2 button[name=\"novo\"], div.gridActions button[name=\"novo\"]');" +
+    "  for (var i = 0; i < gridBtns.length; i++) {" +
+    "    if (gridBtns[i].offsetParent !== null && gridBtns[i].id !== 'novo_form') {" +
+    "      btn = gridBtns[i]; break;" +
+    "    }" +
+    "  }" +
+    "  if (btn) { console.log('Clicando em:', btn.textContent.trim()); btn.click(); }" +
+    "  else console.warn('Botão Novo contrato não encontrado na grid');" +
+    "})()"
+  )
+  await new Promise(r => setTimeout(r, 2000))
+
+  // Debug: verifica se o formulário do contrato abriu
+  var formAbriu = await exec("(function() { var el = document.querySelector('input#id_vd_contrato'); return el ? 'sim' : 'não'; })()")
+  console.log('🔍 Formulário do contrato abriu?', formAbriu.result ? formAbriu.result.value : 'erro')
 
   // Verifica cliente preenchido
   console.log('🔍 Verificando campo cliente...')
@@ -320,7 +337,7 @@ async function cadastrarNoIXC(DADOS) {
 
   // Plano de vendas
   console.log('📝 Preenchendo plano de vendas...')
-  await waitFor('input#id_vd_contrato')
+  await waitFor('input#id_vd_contrato', 15000)
   await exec("(function() { var i = document.querySelector('input#id_vd_contrato'); i.value = '" + DADOS.planoVendas + "'; i.dispatchEvent(new Event('input', {bubbles:true})); i.dispatchEvent(new Event('change', {bubbles:true})); i.dispatchEvent(new KeyboardEvent('keydown', {keyCode:13, bubbles:true})); })()")
   await new Promise(r => setTimeout(r, 500))
 

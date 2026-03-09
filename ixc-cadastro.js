@@ -4,45 +4,152 @@ const CONFIG = {
   host: 'localhost',
   port: 9222,
   ixcUrl: 'sistema.fenixwireless.com.br',
+  opaUrl: 'opasuite.fenixwireless.com.br',
 }
 
-async function getIxcTab() {
-  const resp = await fetch(`http://${CONFIG.host}:${CONFIG.port}/json`)
+// ── Helpers globais ──
+
+async function findTab(urlPart) {
+  const resp = await fetch('http://' + CONFIG.host + ':' + CONFIG.port + '/json')
   const tabs = await resp.json()
-  return tabs.find(t => t.url && t.url.includes(CONFIG.ixcUrl))
+  return tabs.find(t => t.url && t.url.includes(urlPart))
 }
 
-async function main() {
-  console.log('🤖 Conectando no IXC...')
-
-  const tab = await getIxcTab()
-  if (!tab) {
-    console.error('❌ Aba do IXC não encontrada.')
-    process.exit(1)
-  }
-
-  console.log('✅ IXC encontrado:', tab.url)
-
+async function connectTab(tab) {
   await CDP.Activate({ id: tab.id, host: CONFIG.host, port: CONFIG.port })
   await new Promise(r => setTimeout(r, 300))
-
   const client = await CDP({ host: CONFIG.host, port: CONFIG.port, target: tab.id })
   const { Runtime, Page } = client
   await Page.enable()
 
   const exec = (expression) => Runtime.evaluate({ expression, awaitPromise: true })
 
-  // Aguarda elemento aparecer no DOM (max 10s)
-  async function waitFor(selector, timeout = 10000) {
+  async function waitFor(selector, timeout) {
+    timeout = timeout || 10000
     const inicio = Date.now()
     while (Date.now() - inicio < timeout) {
-      const result = await exec(`!!document.querySelector('${selector}')`)
-      if (result.result?.value === true) return true
+      const result = await exec("!!document.querySelector('" + selector + "')")
+      if (result.result && result.result.value === true) return true
       await new Promise(r => setTimeout(r, 200))
     }
-    console.warn(`⚠️ Timeout esperando: ${selector}`)
+    console.warn('⚠️ Timeout esperando: ' + selector)
     return false
   }
+
+  return { client, exec, waitFor }
+}
+
+// ══════════════════════════════════════════
+//  FASE 1 — EXTRAIR DADOS DO OPA
+// ══════════════════════════════════════════
+
+async function extrairDadosOPA() {
+  console.log('🔍 Conectando no OPA...')
+
+  const tab = await findTab(CONFIG.opaUrl)
+  if (!tab) {
+    console.error('❌ Aba do OPA não encontrada.')
+    process.exit(1)
+  }
+
+  console.log('✅ OPA encontrado:', tab.url)
+  const { client, exec, waitFor } = await connectTab(tab)
+
+  // Clica em "Ver todas" pra abrir o modal completo
+  console.log('📋 Abrindo observações...')
+  await waitFor('button.observacao-btn-listar')
+  await exec("document.querySelector('button.observacao-btn-listar').click()")
+  await new Promise(r => setTimeout(r, 2000))
+
+  // Aguarda o modal carregar e extrai o texto da PRIMEIRA observação (mais recente)
+  console.log('📋 Extraindo dados da observação...')
+  const textoObs = await (async function() {
+    const inicio = Date.now()
+    while (Date.now() - inicio < 10000) {
+      const result = await exec(
+        "(function() {" +
+        "  var msgs = document.querySelectorAll('div.corpo-observacao-lista div.observacao_mensagem');" +
+        "  if (msgs.length === 0) msgs = document.querySelectorAll('div.observacao_mensagem');" +
+        "  if (msgs.length > 0) {" +
+        "    var texto = msgs[0].innerText.trim();" +
+        "    if (texto.length > 50) return texto;" +
+        "  }" +
+        "  return '';" +
+        "})()"
+      )
+      if (result.result && result.result.value) return result.result.value
+      await new Promise(r => setTimeout(r, 300))
+    }
+    return ''
+  })()
+
+  if (!textoObs) {
+    console.error('❌ Não consegui extrair a observação do OPA.')
+    await client.close()
+    process.exit(1)
+  }
+
+  console.log('✅ Observação extraída!')
+  console.log(textoObs)
+
+  // Parseia cada linha "Label: Valor"
+  var dados = {}
+  var linhas = textoObs.split('\n')
+  for (var i = 0; i < linhas.length; i++) {
+    var linha = linhas[i]
+    var idx = linha.indexOf(':')
+    if (idx > -1) {
+      var chave = linha.substring(0, idx).trim().toLowerCase()
+      var valor = linha.substring(idx + 1).trim()
+      dados[chave] = valor
+    }
+  }
+
+  console.log('📦 Dados parseados:', dados)
+
+  await client.close()
+
+  // Limpa CPF e CEP (remove pontos, traços, espaços)
+  var cpfLimpo = (dados['cpf'] || '').replace(/\D/g, '')
+  var cepLimpo = (dados['cep'] || '').replace(/\D/g, '')
+
+  return {
+    nome: dados['nome'] || '',
+    cpf: cpfLimpo,
+    dataNascimento: dados['data de nascimento'] || '',
+    email: dados['e-mail'] || '',
+    celular: dados['celular'] || '',
+    vencimento: dados['dia de vencimento preferido'] || '',
+    planoVendas: dados['plano escolhido'] || '',
+    cep: cepLimpo,
+    endereco: dados['endereço'] || dados['endereco'] || '',
+    numero: dados['número'] || dados['numero'] || '',
+    bairro: dados['bairro'] || '',
+    cto: dados['cto'] || '',
+    distancia: dados['distância'] || dados['distancia'] || '',
+    vendaDia: dados['dia da venda'] || '',
+    instalacaoDia: dados['dia da instalação'] || dados['dia da instalacao'] || '',
+    turno: dados['turno'] || '',
+    roteadorExtra: dados['roteador extra'] || 'Não',
+    assuntoOS: dados['assunto os'] || '1',
+  }
+}
+
+// ══════════════════════════════════════════
+//  FASE 2 — CADASTRO NO IXC
+// ══════════════════════════════════════════
+
+async function cadastrarNoIXC(DADOS) {
+  console.log('🤖 Conectando no IXC...')
+
+  const tab = await findTab(CONFIG.ixcUrl)
+  if (!tab) {
+    console.error('❌ Aba do IXC não encontrada.')
+    process.exit(1)
+  }
+
+  console.log('✅ IXC encontrado:', tab.url)
+  const { client, exec, waitFor } = await connectTab(tab)
 
   // Aceita dialog nativo automaticamente
   client.on('Page.javascriptDialogOpening', async () => {
@@ -51,120 +158,76 @@ async function main() {
 
   // Recarrega
   console.log('🔄 Recarregando IXC...')
-  await Page.reload()
+  await client.send('Page.reload')
   await new Promise(r => setTimeout(r, 3000))
+
+  // ── CADASTRO DO CLIENTE ──
 
   // 1. Clica em Cadastros
   console.log('📂 Abrindo Cadastros...')
   await waitFor('div.submenu_title a')
-  await exec(`document.querySelector('div.submenu_title a').click()`)
+  await exec("document.querySelector('div.submenu_title a').click()")
   await new Promise(r => setTimeout(r, 800))
 
   // 2. Clica em Clientes
   console.log('👤 Abrindo Clientes...')
   await waitFor('li#menu_item_cliente')
-  await exec(`document.querySelector('li#menu_item_cliente a').click()`)
-  await waitFor('button[name="novo"]')
+  await exec("document.querySelector('li#menu_item_cliente a').click()")
+  await waitFor('button[name=\"novo\"]')
 
   // 3. Clica em Novo
   console.log('➕ Clicando em Novo...')
-  await exec(`document.querySelector('button[name="novo"]').click()`)
+  await exec("document.querySelector('button[name=\"novo\"]').click()")
   await waitFor('input#id_tipo_cliente')
 
   // 4. Tipo de cliente = 1
   console.log('📝 Tipo de cliente = 1...')
-  await exec(`
-    (function() {
-      const input = document.querySelector('input#id_tipo_cliente')
-      input.value = '1'
-      input.dispatchEvent(new Event('input', { bubbles: true }))
-      input.dispatchEvent(new Event('change', { bubbles: true }))
-    })()
-  `)
+  await exec("(function() { var i = document.querySelector('input#id_tipo_cliente'); i.value = '1'; i.dispatchEvent(new Event('input', {bubbles:true})); i.dispatchEvent(new Event('change', {bubbles:true})); })()")
   await new Promise(r => setTimeout(r, 500))
 
   // 5. Tipo de cliente fiscal = 03
   console.log('📝 Tipo de cliente fiscal = 03...')
   await waitFor('select#tipo_cliente_scm')
-  await exec(`
-    (function() {
-      const select = document.querySelector('select#tipo_cliente_scm')
-      select.value = '03'
-      select.dispatchEvent(new Event('change', { bubbles: true }))
-    })()
-  `)
+  await exec("(function() { var s = document.querySelector('select#tipo_cliente_scm'); s.value = '03'; s.dispatchEvent(new Event('change', {bubbles:true})); })()")
 
   // 6. CPF
   console.log('📝 Preenchendo CPF...')
   await waitFor('input#cnpj_cpf')
-  await exec(`
-    (function() {
-      const input = document.querySelector('input#cnpj_cpf')
-      input.value = '01234567890'
-      input.dispatchEvent(new Event('input', { bubbles: true }))
-      input.dispatchEvent(new Event('change', { bubbles: true }))
-    })()
-  `)
+  await exec("(function() { var i = document.querySelector('input#cnpj_cpf'); i.value = '" + DADOS.cpf + "'; i.dispatchEvent(new Event('input', {bubbles:true})); i.dispatchEvent(new Event('change', {bubbles:true})); })()")
   await new Promise(r => setTimeout(r, 500))
 
   // 7. Data de nascimento
   console.log('📝 Preenchendo data de nascimento...')
   await waitFor('input#data_nascimento')
-  await exec(`
-    (function() {
-      const input = document.querySelector('input#data_nascimento')
-      input.value = '01/01/1990'
-      input.dispatchEvent(new Event('input', { bubbles: true }))
-      input.dispatchEvent(new Event('change', { bubbles: true }))
-    })()
-  `)
+  await exec("(function() { var i = document.querySelector('input#data_nascimento'); i.value = '" + DADOS.dataNascimento + "'; i.dispatchEvent(new Event('input', {bubbles:true})); i.dispatchEvent(new Event('change', {bubbles:true})); })()")
 
-  // 8. Nome do cliente (Razão Social)
+  // 8. Nome
   console.log('📝 Preenchendo nome...')
   await waitFor('input#razao')
-  await exec(`
-    (function() {
-      const input = document.querySelector('input#razao')
-      input.value = 'João da Silva Teste'
-      input.dispatchEvent(new Event('input', { bubbles: true }))
-      input.dispatchEvent(new Event('change', { bubbles: true }))
-    })()
-  `)
+  await exec("(function() { var i = document.querySelector('input#razao'); i.value = '" + DADOS.nome + "'; i.dispatchEvent(new Event('input', {bubbles:true})); i.dispatchEvent(new Event('change', {bubbles:true})); })()")
 
-  // 9. Clica na aba Endereço
+  // ── Aba Endereço ──
   console.log('📍 Abrindo aba Endereço...')
-  await waitFor('a.tabTitle[rel="1"]')
-  await exec(`document.querySelector('a.tabTitle[rel="1"]').click()`)
+  await waitFor('a.tabTitle[rel=\"1\"]')
+  await exec("document.querySelector('a.tabTitle[rel=\"1\"]').click()")
   await waitFor('input#cep')
 
-  // 10. Preenche CEP
+  // CEP
   console.log('📝 Preenchendo CEP...')
-  await exec(`
-    (function() {
-      const input = document.querySelector('input#cep')
-      input.value = '93310040'
-      input.dispatchEvent(new Event('input', { bubbles: true }))
-      input.dispatchEvent(new Event('change', { bubbles: true }))
-    })()
-  `)
+  await exec("(function() { var i = document.querySelector('input#cep'); i.value = '" + DADOS.cep + "'; i.dispatchEvent(new Event('input', {bubbles:true})); i.dispatchEvent(new Event('change', {bubbles:true})); })()")
   await new Promise(r => setTimeout(r, 300))
 
-  // 11. Clica em Validar
+  // Validar CEP
   console.log('🔍 Validando CEP...')
-  await exec(`document.querySelector('button#buscacep').click()`)
+  await exec("document.querySelector('button#buscacep').click()")
 
-  // 12. Aguarda cidade aparecer (sinal que o CEP foi validado)
+  // Aguarda cidade
   console.log('⏳ Aguardando cidade...')
-  const cidadeOk = await (async () => {
-    const inicio = Date.now()
+  var cidadeOk = await (async function() {
+    var inicio = Date.now()
     while (Date.now() - inicio < 10000) {
-      const result = await exec(`
-        (function() {
-          const el = document.querySelector('input#cidade_label')
-          return el && el.value && el.value.trim().length > 0 ? el.value : ''
-        })()
-      `)
-      if (result.result?.value) {
+      var result = await exec("(function() { var el = document.querySelector('input#cidade_label'); return el && el.value && el.value.trim().length > 0 ? el.value : ''; })()")
+      if (result.result && result.result.value) {
         console.log('✅ Cidade encontrada:', result.result.value)
         return true
       }
@@ -174,312 +237,167 @@ async function main() {
   })()
 
   if (!cidadeOk) {
-    await exec(`alert('⚠️ CEP não encontrado! Verifique o CEP e tente novamente.')`)
+    await exec("alert('⚠️ CEP não encontrado! Verifique o CEP e tente novamente.')")
     console.error('❌ CEP inválido ou não encontrado.')
     await client.close()
     return
   }
 
-  // 13. Preenche Endereço
+  // Endereço
   console.log('📝 Preenchendo endereço...')
-  await exec(`
-    (function() {
-      const input = document.querySelector('input#endereco')
-      input.value = 'Rua Teste'
-      input.dispatchEvent(new Event('input', { bubbles: true }))
-      input.dispatchEvent(new Event('change', { bubbles: true }))
-    })()
-  `)
+  await exec("(function() { var i = document.querySelector('input#endereco'); i.value = '" + DADOS.endereco + "'; i.dispatchEvent(new Event('input', {bubbles:true})); i.dispatchEvent(new Event('change', {bubbles:true})); })()")
 
-  // 14. Preenche Número
+  // Número
   console.log('📝 Preenchendo número...')
-  await exec(`
-    (function() {
-      const input = document.querySelector('input#numero')
-      input.value = '123'
-      input.dispatchEvent(new Event('input', { bubbles: true }))
-      input.dispatchEvent(new Event('change', { bubbles: true }))
-    })()
-  `)
+  await exec("(function() { var i = document.querySelector('input#numero'); i.value = '" + DADOS.numero + "'; i.dispatchEvent(new Event('input', {bubbles:true})); i.dispatchEvent(new Event('change', {bubbles:true})); })()")
 
-  // 15. Preenche Bairro
+  // Bairro
   console.log('📝 Preenchendo bairro...')
-  await exec(`
-    (function() {
-      const input = document.querySelector('input#bairro')
-      input.value = 'Centro'
-      input.dispatchEvent(new Event('input', { bubbles: true }))
-      input.dispatchEvent(new Event('change', { bubbles: true }))
-    })()
-  `)
+  await exec("(function() { var i = document.querySelector('input#bairro'); i.value = '" + DADOS.bairro + "'; i.dispatchEvent(new Event('input', {bubbles:true})); i.dispatchEvent(new Event('change', {bubbles:true})); })()")
 
-  // Aba Contato
+  // ── Aba Contato ──
   console.log('📞 Abrindo aba Contato...')
-  await waitFor('a.tabTitle[rel="2"]')
-  await exec(`document.querySelector('a.tabTitle[rel="2"]').click()`)
+  await waitFor('a.tabTitle[rel=\"2\"]')
+  await exec("document.querySelector('a.tabTitle[rel=\"2\"]').click()")
   await waitFor('input#telefone_celular')
 
-  // Telefone celular
   console.log('📝 Preenchendo telefone celular...')
-  await exec(`
-    (function() {
-      const input = document.querySelector('input#telefone_celular')
-      input.value = '51999999999'
-      input.dispatchEvent(new Event('input', { bubbles: true }))
-      input.dispatchEvent(new Event('change', { bubbles: true }))
-    })()
-  `)
+  await exec("(function() { var i = document.querySelector('input#telefone_celular'); i.value = '" + DADOS.celular + "'; i.dispatchEvent(new Event('input', {bubbles:true})); i.dispatchEvent(new Event('change', {bubbles:true})); })()")
 
-  // WhatsApp
   console.log('📝 Preenchendo WhatsApp...')
-  await exec(`
-    (function() {
-      const input = document.querySelector('input#whatsapp')
-      input.value = '51999999999'
-      input.dispatchEvent(new Event('input', { bubbles: true }))
-      input.dispatchEvent(new Event('change', { bubbles: true }))
-    })()
-  `)
+  await exec("(function() { var i = document.querySelector('input#whatsapp'); i.value = '" + DADOS.celular + "'; i.dispatchEvent(new Event('input', {bubbles:true})); i.dispatchEvent(new Event('change', {bubbles:true})); })()")
 
-  // Email
   console.log('📝 Preenchendo email...')
-  await exec(`
-    (function() {
-      const input = document.querySelector('input#email')
-      input.value = 'teste@email.com'
-      input.dispatchEvent(new Event('input', { bubbles: true }))
-      input.dispatchEvent(new Event('change', { bubbles: true }))
-    })()
-  `)
+  await exec("(function() { var i = document.querySelector('input#email'); i.value = '" + DADOS.email + "'; i.dispatchEvent(new Event('input', {bubbles:true})); i.dispatchEvent(new Event('change', {bubbles:true})); })()")
 
-  // Login (CPF sem pontos)
+  // Login e Senha = CPF
   console.log('📝 Preenchendo login...')
-  await exec(`
-    (function() {
-      const input = document.querySelector('input#hotsite_email')
-      input.value = '01234567890'
-      input.dispatchEvent(new Event('input', { bubbles: true }))
-      input.dispatchEvent(new Event('change', { bubbles: true }))
-    })()
-  `)
+  await exec("(function() { var i = document.querySelector('input#hotsite_email'); i.value = '" + DADOS.cpf + "'; i.dispatchEvent(new Event('input', {bubbles:true})); i.dispatchEvent(new Event('change', {bubbles:true})); })()")
 
-  // Senha (CPF sem pontos)
   console.log('📝 Preenchendo senha...')
-  await exec(`
-    (function() {
-      const input = document.querySelector('input#senha')
-      input.value = '01234567890'
-      input.dispatchEvent(new Event('input', { bubbles: true }))
-      input.dispatchEvent(new Event('change', { bubbles: true }))
-    })()
-  `)
+  await exec("(function() { var i = document.querySelector('input#senha'); i.value = '" + DADOS.cpf + "'; i.dispatchEvent(new Event('input', {bubbles:true})); i.dispatchEvent(new Event('change', {bubbles:true})); })()")
 
-  // Aba Contratos
+  // ── Aba Contratos ──
   console.log('📋 Abrindo aba Contratos...')
-  await waitFor('a.tabTitle[rel="7"]')
-  await exec(`document.querySelector('a.tabTitle[rel="7"]').click()`)
+  await waitFor('a.tabTitle[rel=\"7\"]')
+  await exec("document.querySelector('a.tabTitle[rel=\"7\"]').click()")
   await new Promise(r => setTimeout(r, 800))
 
   // Salvar cliente
   console.log('💾 Salvando cliente...')
-  await exec(`document.querySelector('button[type="submit"][title="Alt+S"]').click()`)
+  await exec("document.querySelector('button[type=\"submit\"][title=\"Alt+S\"]').click()")
 
-  // Aguarda confirmação de salvo — lê notificação do IXC
   console.log('⏳ Aguardando confirmação de salvo...')
-  const salvou = await (async () => {
-    const inicio = Date.now()
-    while (Date.now() - inicio < 15000) {
-      const result = await exec(`
-        (function() {
-          const el = document.querySelector('div.notificationMessage span')
-          return el && el.innerText ? el.innerText.trim() : ''
-        })()
-      `)
-      if (result.result?.value) {
-        console.log('✅ Resposta IXC:', result.result.value)
-        return true
-      }
-      await new Promise(r => setTimeout(r, 300))
-    }
-    return false
-  })()
+  var salvou = await waitForNotification(exec)
 
   if (!salvou) {
-    console.warn('⚠️ Não detectei confirmação de salvo — esperando 5s e continuando...')
+    console.warn('⚠️ Não detectei confirmação — esperando 5s...')
     await new Promise(r => setTimeout(r, 5000))
   }
 
-  // ══════════════════════════════════════════
-  //  PARTE 2 — CONTRATO
-  // ══════════════════════════════════════════
+  // ── CONTRATO ──
 
-  // Novo contrato
   console.log('➕ Clicando em Novo contrato...')
-  await waitFor('button[name="novo"].fbutton')
-  await exec(`document.querySelector('button[name="novo"].fbutton').click()`)
+  await waitFor('button[name=\"novo\"].fbutton')
+  await exec("document.querySelector('button[name=\"novo\"].fbutton').click()")
   await new Promise(r => setTimeout(r, 1000))
 
-  // Verifica se campo cliente veio preenchido
+  // Verifica cliente preenchido
   console.log('🔍 Verificando campo cliente...')
-  const clienteOk = await (async () => {
-    const inicio = Date.now()
+  var clienteOk = await (async function() {
+    var inicio = Date.now()
     while (Date.now() - inicio < 5000) {
-      const result = await exec(`
-        (function() {
-          const el = document.querySelector('input#id_cliente')
-          return el && el.value && el.value.trim().length > 0 ? el.value : ''
-        })()
-      `)
-      if (result.result?.value) return true
+      var result = await exec("(function() { var el = document.querySelector('input#id_cliente'); return el && el.value && el.value.trim().length > 0 ? el.value : ''; })()")
+      if (result.result && result.result.value) return true
       await new Promise(r => setTimeout(r, 300))
     }
     return false
   })()
 
   if (!clienteOk) {
-    await exec(`alert('⚠️ Campo cliente não preenchido automaticamente! Selecione o cliente manualmente e clique OK para continuar.')`)
-    console.warn('⚠️ Cliente não preenchido — aguardando ação manual...')
+    await exec("alert('⚠️ Campo cliente não preenchido! Selecione manualmente e clique OK.')")
   }
 
-  // Plano de vendas (código vem do OPA ex: 848, 903, 906)
+  // Plano de vendas
   console.log('📝 Preenchendo plano de vendas...')
   await waitFor('input#id_vd_contrato')
-  await exec(`
-    (function() {
-      const input = document.querySelector('input#id_vd_contrato')
-      input.value = '848'
-      input.dispatchEvent(new Event('input', { bubbles: true }))
-      input.dispatchEvent(new Event('change', { bubbles: true }))
-      input.dispatchEvent(new KeyboardEvent('keydown', { keyCode: 13, bubbles: true }))
-    })()
-  `)
+  await exec("(function() { var i = document.querySelector('input#id_vd_contrato'); i.value = '" + DADOS.planoVendas + "'; i.dispatchEvent(new Event('input', {bubbles:true})); i.dispatchEvent(new Event('change', {bubbles:true})); i.dispatchEvent(new KeyboardEvent('keydown', {keyCode:13, bubbles:true})); })()")
   await new Promise(r => setTimeout(r, 500))
 
-  // Tipo de contrato / vencimento (dia: 7, 12 ou 16 — vem do OPA)
-  console.log('📝 Preenchendo tipo de contrato/vencimento...')
+  // Vencimento
+  console.log('📝 Preenchendo vencimento...')
   await waitFor('input#id_tipo_contrato')
-  await exec(`
-    (function() {
-      const input = document.querySelector('input#id_tipo_contrato')
-      input.value = '7'
-      input.dispatchEvent(new Event('input', { bubbles: true }))
-      input.dispatchEvent(new Event('change', { bubbles: true }))
-      input.dispatchEvent(new KeyboardEvent('keydown', { keyCode: 13, bubbles: true }))
-    })()
-  `)
+  await exec("(function() { var i = document.querySelector('input#id_tipo_contrato'); i.value = '" + DADOS.vencimento + "'; i.dispatchEvent(new Event('input', {bubbles:true})); i.dispatchEvent(new Event('change', {bubbles:true})); i.dispatchEvent(new KeyboardEvent('keydown', {keyCode:13, bubbles:true})); })()")
   await new Promise(r => setTimeout(r, 500))
 
   // Motivo de inclusão — sempre 1
   console.log('📝 Preenchendo motivo de inclusão...')
   await waitFor('input#id_motivo_inclusao')
-  await exec(`
-    (function() {
-      const input = document.querySelector('input#id_motivo_inclusao')
-      input.value = '1'
-      input.dispatchEvent(new Event('input', { bubbles: true }))
-      input.dispatchEvent(new Event('change', { bubbles: true }))
-      input.dispatchEvent(new KeyboardEvent('keydown', { keyCode: 13, bubbles: true }))
-    })()
-  `)
+  await exec("(function() { var i = document.querySelector('input#id_motivo_inclusao'); i.value = '1'; i.dispatchEvent(new Event('input', {bubbles:true})); i.dispatchEvent(new Event('change', {bubbles:true})); i.dispatchEvent(new KeyboardEvent('keydown', {keyCode:13, bubbles:true})); })()")
   await new Promise(r => setTimeout(r, 500))
 
   // Carteira de cobrança — sempre 7
   console.log('📝 Preenchendo carteira de cobrança...')
   await waitFor('input#id_carteira_cobranca')
-  await exec(`
-    (function() {
-      const input = document.querySelector('input#id_carteira_cobranca')
-      input.value = '7'
-      input.dispatchEvent(new Event('input', { bubbles: true }))
-      input.dispatchEvent(new Event('change', { bubbles: true }))
-      input.dispatchEvent(new KeyboardEvent('keydown', { keyCode: 13, bubbles: true }))
-    })()
-  `)
+  await exec("(function() { var i = document.querySelector('input#id_carteira_cobranca'); i.value = '7'; i.dispatchEvent(new Event('input', {bubbles:true})); i.dispatchEvent(new Event('change', {bubbles:true})); i.dispatchEvent(new KeyboardEvent('keydown', {keyCode:13, bubbles:true})); })()")
   await new Promise(r => setTimeout(r, 500))
 
   // Salvar contrato
   console.log('💾 Salvando contrato...')
-  await exec(`document.querySelector('button[type="submit"][title="Alt+S"]').click()`)
+  await exec("document.querySelector('button[type=\"submit\"][title=\"Alt+S\"]').click()")
 
-  // Aguarda confirmação de salvo do contrato
-  console.log('⏳ Aguardando confirmação de salvo do contrato...')
-  const salvouContrato = await (async () => {
-    const inicio = Date.now()
-    while (Date.now() - inicio < 15000) {
-      const result = await exec(`
-        (function() {
-          const el = document.querySelector('div.notificationMessage span')
-          return el && el.innerText ? el.innerText.trim() : ''
-        })()
-      `)
-      if (result.result?.value) {
-        console.log('✅ Resposta IXC:', result.result.value)
-        return true
-      }
-      await new Promise(r => setTimeout(r, 300))
-    }
-    return false
-  })()
-
+  console.log('⏳ Aguardando confirmação do contrato...')
+  var salvouContrato = await waitForNotification(exec)
   if (!salvouContrato) {
     console.warn('⚠️ Não detectei confirmação do contrato — esperando 5s...')
     await new Promise(r => setTimeout(r, 5000))
   }
 
-  // Fechar formulário do contrato (ESC)
+  // Fechar contrato (ESC)
   console.log('🔙 Fechando formulário do contrato...')
-  await exec(`
-    document.dispatchEvent(new KeyboardEvent('keydown', {
-      key: 'Escape', code: 'Escape', keyCode: 27, bubbles: true
-    }))
-  `)
+  await exec("document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', keyCode: 27, bubbles: true }))")
   await new Promise(r => setTimeout(r, 500))
 
-  // ══════════════════════════════════════════
-  //  PARTE 3 — LOGIN
-  // ══════════════════════════════════════════
+  // ── LOGIN ──
 
   // Aba Logins
   console.log('🔐 Abrindo aba Logins...')
-  await waitFor('a.tabTitle[rel="10"]')
-  await exec(`document.querySelector('a.tabTitle[rel="10"]').click()`)
+  await waitFor('a.tabTitle[rel=\"10\"]')
+  await exec("document.querySelector('a.tabTitle[rel=\"10\"]').click()")
   await new Promise(r => setTimeout(r, 1000))
 
-  // Clica em Novo na grid de logins
+  // Novo login
   console.log('➕ Clicando em Novo login...')
-  await waitFor('div.gridActions button[name="novo"]')
-  await exec(`document.querySelector('div.gridActions button[name="novo"]').click()`)
+  await waitFor('div.gridActions button[name=\"novo\"]')
+  await exec("document.querySelector('div.gridActions button[name=\"novo\"]').click()")
   await new Promise(r => setTimeout(r, 1500))
 
-  // Clica na lupa do campo Contrato para abrir a busca
+  // Lupa do contrato
   console.log('🔍 Abrindo busca de contrato...')
-  await waitFor('button[rel="id_contrato"].but_search')
-  await exec(`document.querySelector('button[rel="id_contrato"].but_search').click()`)
+  await waitFor('button[rel=\"id_contrato\"].but_search')
+  await exec("document.querySelector('button[rel=\"id_contrato\"].but_search').click()")
   await new Promise(r => setTimeout(r, 1500))
 
-  // Seleciona o contrato com status "Pré-contrato"
+  // Seleciona Pré-contrato (double-click)
   console.log('📋 Selecionando contrato Pré-contrato...')
-  const contratoSelecionado = await (async () => {
-    const inicio = Date.now()
+  var contratoSelecionado = await (async function() {
+    var inicio = Date.now()
     while (Date.now() - inicio < 10000) {
-      const result = await exec(`
-        (function() {
-          // Procura a célula com badge "Pré-contrato" na listagem
-          const badge = document.querySelector('span.vg-badge-content')
-          if (badge && badge.textContent.trim() === 'Pré-contrato') {
-            // Clica na linha (tr) que contém esse badge
-            const row = badge.closest('tr')
-            if (row) {
-              row.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }))
-              // Tenta pegar o ID do contrato da primeira célula
-              const idCell = row.querySelector('td:first-child')
-              return idCell ? idCell.textContent.trim() : 'selecionado'
-            }
-          }
-          return ''
-        })()
-      `)
-      if (result.result?.value) {
+      var result = await exec(
+        "(function() {" +
+        "  var badge = document.querySelector('span.vg-badge-content');" +
+        "  if (badge && badge.textContent.trim() === 'Pré-contrato') {" +
+        "    var row = badge.closest('tr');" +
+        "    if (row) {" +
+        "      row.dispatchEvent(new MouseEvent('dblclick', {bubbles:true}));" +
+        "      var idCell = row.querySelector('td:first-child');" +
+        "      return idCell ? idCell.textContent.trim() : 'selecionado';" +
+        "    }" +
+        "  }" +
+        "  return '';" +
+        "})()"
+      )
+      if (result.result && result.result.value) {
         console.log('✅ Contrato selecionado:', result.result.value)
         return true
       }
@@ -489,83 +407,64 @@ async function main() {
   })()
 
   if (!contratoSelecionado) {
-    console.warn('⚠️ Não encontrei contrato com Pré-contrato — selecione manualmente.')
-    await exec(`alert('⚠️ Não encontrei contrato Pré-contrato! Selecione manualmente e clique OK.')`)
+    await exec("alert('⚠️ Contrato Pré-contrato não encontrado! Selecione manualmente.')")
   }
 
-  // Aguarda um pouco pra modal fechar e campo preencher
   await new Promise(r => setTimeout(r, 1000))
 
-  // Captura o número do contrato preenchido (vai ser usado em campos abaixo)
+  // Captura número do contrato
   console.log('📋 Capturando número do contrato...')
-  const numeroContrato = await (async () => {
-    const inicio = Date.now()
+  var numeroContrato = await (async function() {
+    var inicio = Date.now()
     while (Date.now() - inicio < 5000) {
-      const result = await exec(`
-        (function() {
-          const el = document.querySelector('input#id_contrato')
-          return el && el.value && el.value.trim().length > 0 ? el.value : ''
-        })()
-      `)
-      if (result.result?.value) return result.result.value
+      var result = await exec("(function() { var el = document.querySelector('input#id_contrato'); return el && el.value && el.value.trim().length > 0 ? el.value : ''; })()")
+      if (result.result && result.result.value) return result.result.value
       await new Promise(r => setTimeout(r, 300))
     }
     return ''
   })()
 
   if (numeroContrato) {
-    console.log('✅ Número do contrato capturado:', numeroContrato)
+    console.log('✅ Número do contrato:', numeroContrato)
   } else {
     console.warn('⚠️ Não consegui capturar o número do contrato.')
   }
 
-  // Verifica se o contrato foi preenchido corretamente no label
-  const contratoLabel = await exec(`
-    (function() {
-      const el = document.querySelector('input#id_contrato_label')
-      return el && el.value ? el.value.trim() : ''
-    })()
-  `)
-  if (contratoLabel.result?.value) {
-    console.log('✅ Contrato confirmado:', contratoLabel.result.value)
-  }
-
-  // Clica na lupa do Plano (grupo)
+  // Lupa do plano (grupo)
   console.log('🔍 Abrindo busca de plano...')
-  await waitFor('button[rel="id_grupo"].but_search')
-  await exec(`
-    (function() {
-      // Pega a segunda lupa (last-visible) que é a que abre a listagem
-      const btns = document.querySelectorAll('button[rel="id_grupo"].but_search')
-      const btn = Array.from(btns).find(b => b.style.marginLeft || b.classList.contains('last-visible')) || btns[btns.length - 1]
-      btn.click()
-    })()
-  `)
+  await waitFor('button[rel=\"id_grupo\"].but_search')
+  await exec(
+    "(function() {" +
+    "  var btns = document.querySelectorAll('button[rel=\"id_grupo\"].but_search');" +
+    "  var btn = Array.from(btns).find(function(b) { return b.style.marginLeft || b.classList.contains('last-visible'); }) || btns[btns.length - 1];" +
+    "  btn.click();" +
+    "})()"
+  )
   await new Promise(r => setTimeout(r, 1500))
 
-  // Clica em Atualizar pra carregar o plano
+  // Atualizar pra carregar o plano
   console.log('🔄 Atualizando listagem de planos...')
-  await waitFor('i.fa-arrows-rotate[title="Atualizar"]')
-  await exec(`document.querySelector('i.fa-arrows-rotate[title="Atualizar"]').click()`)
+  await waitFor('i.fa-arrows-rotate[title=\"Atualizar\"]')
+  await exec("document.querySelector('i.fa-arrows-rotate[title=\"Atualizar\"]').click()")
   await new Promise(r => setTimeout(r, 1500))
 
-  // Seleciona o primeiro plano da lista (clica na primeira linha do tbody)
+  // Double-click no plano
   console.log('📋 Selecionando plano...')
-  const planoSelecionado = await (async () => {
-    const inicio = Date.now()
+  var planoSelecionado = await (async function() {
+    var inicio = Date.now()
     while (Date.now() - inicio < 10000) {
-      const result = await exec(`
-        (function() {
-          const row = document.querySelector('tbody tr.tableRow')
-          if (row) {
-            row.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }))
-            const id = row.getAttribute('data-valorcampoautoincrement')
-            return id || 'selecionado'
-          }
-          return ''
-        })()
-      `)
-      if (result.result?.value) {
+      var result = await exec(
+        "(function() {" +
+        "  var row = document.querySelector('tbody tr.tableRow');" +
+        "  if (row) {" +
+        "    row.dispatchEvent(new MouseEvent('dblclick', {bubbles:true}));" +
+        "    var id = row.getAttribute('data-valorcampoautoincrement');" +
+        "    return id || 'selecionado';" +
+        "  }" +
+        "  return '';" +
+        "})()"
+      )
+      if (result.result && result.result.value) {
         console.log('✅ Plano selecionado:', result.result.value)
         return true
       }
@@ -575,95 +474,69 @@ async function main() {
   })()
 
   if (!planoSelecionado) {
-    console.warn('⚠️ Não encontrei plano na listagem — selecione manualmente.')
-    await exec(`alert('⚠️ Plano não encontrado! Selecione manualmente e clique OK.')`)
+    await exec("alert('⚠️ Plano não encontrado! Selecione manualmente.')")
   }
 
   await new Promise(r => setTimeout(r, 1000))
 
-  // Preenche Login com número do contrato
+  // Login = número do contrato
   console.log('📝 Preenchendo login com número do contrato...')
   await waitFor('input#login')
-  await exec(`
-    (function() {
-      const input = document.querySelector('input#login')
-      input.value = '${numeroContrato}'
-      input.dispatchEvent(new Event('input', { bubbles: true }))
-      input.dispatchEvent(new Event('change', { bubbles: true }))
-    })()
-  `)
+  await exec("(function() { var i = document.querySelector('input#login'); i.value = '" + numeroContrato + "'; i.dispatchEvent(new Event('input', {bubbles:true})); i.dispatchEvent(new Event('change', {bubbles:true})); })()")
 
-  // Preenche Senha PPPoE com número do contrato
-  console.log('📝 Preenchendo senha PPPoE com número do contrato...')
+  // Senha PPPoE = número do contrato
+  console.log('📝 Preenchendo senha PPPoE...')
   await waitFor('input#senha')
-  await exec(`
-    (function() {
-      const input = document.querySelector('input#senha')
-      input.value = '${numeroContrato}'
-      input.dispatchEvent(new Event('input', { bubbles: true }))
-      input.dispatchEvent(new Event('change', { bubbles: true }))
-    })()
-  `)
+  await exec("(function() { var i = document.querySelector('input#senha'); i.value = '" + numeroContrato + "'; i.dispatchEvent(new Event('input', {bubbles:true})); i.dispatchEvent(new Event('change', {bubbles:true})); })()")
 
-  // ══════════════════════════════════════════
-  //  PARTE 4 — DADOS TÉCNICOS
-  // ══════════════════════════════════════════
+  // ── DADOS TÉCNICOS ──
 
-  // Abre aba Dados técnicos
+  // Aba Dados técnicos
   console.log('🔧 Abrindo aba Dados técnicos...')
-  await waitFor('a.tabTitle[rel="dados_tecnicos"]')  // ajustar rel se diferente
-  await exec(`
-    (function() {
-      const tabs = document.querySelectorAll('a.tabTitle')
-      const tab = Array.from(tabs).find(t => t.textContent.trim() === 'Dados técnicos')
-      if (tab) tab.click()
-    })()
-  `)
+  await exec(
+    "(function() {" +
+    "  var tabs = document.querySelectorAll('a.tabTitle');" +
+    "  var tab = Array.from(tabs).find(function(t) { return t.textContent.trim() === 'Dados técnicos'; });" +
+    "  if (tab) tab.click();" +
+    "})()"
+  )
   await new Promise(r => setTimeout(r, 1000))
 
-  // Clica na lupa da Caixa de atendimento
+  // Lupa da caixa de atendimento
   console.log('🔍 Abrindo busca de caixa de atendimento...')
-  await waitFor('button[rel="id_caixa_ftth"].but_search')
-  await exec(`
-    (function() {
-      const btns = document.querySelectorAll('button[rel="id_caixa_ftth"].but_search')
-      const btn = Array.from(btns).find(b => b.classList.contains('last-visible')) || btns[btns.length - 1]
-      btn.click()
-    })()
-  `)
+  await waitFor('button[rel=\"id_caixa_ftth\"].but_search')
+  await exec(
+    "(function() {" +
+    "  var btns = document.querySelectorAll('button[rel=\"id_caixa_ftth\"].but_search');" +
+    "  var btn = Array.from(btns).find(function(b) { return b.classList.contains('last-visible'); }) || btns[btns.length - 1];" +
+    "  btn.click();" +
+    "})()"
+  )
   await new Promise(r => setTimeout(r, 1500))
 
-  // Pesquisa a caixa de atendimento (dado que vem do OPA)
-  const caixaAtendimento = 'SM002-01-15' // TODO: vem do OPA
-  console.log('🔍 Pesquisando caixa:', caixaAtendimento)
+  // Pesquisa a caixa (CTO do OPA)
+  console.log('🔍 Pesquisando caixa:', DADOS.cto)
   await waitFor('input.gridActionsSearchInput')
-  await exec(`
-    (function() {
-      const input = document.querySelector('input.gridActionsSearchInput')
-      input.value = '${caixaAtendimento}'
-      input.dispatchEvent(new Event('input', { bubbles: true }))
-      input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', keyCode: 13, bubbles: true }))
-    })()
-  `)
+  await exec("(function() { var i = document.querySelector('input.gridActionsSearchInput'); i.value = '" + DADOS.cto + "'; i.dispatchEvent(new Event('input', {bubbles:true})); i.dispatchEvent(new KeyboardEvent('keydown', {key:'Enter', keyCode:13, bubbles:true})); })()")
   await new Promise(r => setTimeout(r, 2000))
 
-  // Double-click na primeira linha pra selecionar a caixa
-  console.log('📋 Selecionando caixa de atendimento...')
-  const caixaSelecionada = await (async () => {
-    const inicio = Date.now()
+  // Double-click na caixa
+  console.log('📋 Selecionando caixa...')
+  var caixaSelecionada = await (async function() {
+    var inicio = Date.now()
     while (Date.now() - inicio < 10000) {
-      const result = await exec(`
-        (function() {
-          const row = document.querySelector('table#grid_rel_id_caixa_ftth3 tbody tr.tableRow, tbody tr.tableRow')
-          if (row) {
-            row.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }))
-            const id = row.getAttribute('data-valorcampoautoincrement')
-            return id || 'selecionado'
-          }
-          return ''
-        })()
-      `)
-      if (result.result?.value) {
+      var result = await exec(
+        "(function() {" +
+        "  var row = document.querySelector('tbody tr.tableRow');" +
+        "  if (row) {" +
+        "    row.dispatchEvent(new MouseEvent('dblclick', {bubbles:true}));" +
+        "    var id = row.getAttribute('data-valorcampoautoincrement');" +
+        "    return id || 'selecionado';" +
+        "  }" +
+        "  return '';" +
+        "})()"
+      )
+      if (result.result && result.result.value) {
         console.log('✅ Caixa selecionada:', result.result.value)
         return true
       }
@@ -673,52 +546,47 @@ async function main() {
   })()
 
   if (!caixaSelecionada) {
-    console.warn('⚠️ Caixa não encontrada — selecione manualmente.')
-    await exec(`alert('⚠️ Caixa de atendimento não encontrada! Selecione manualmente e clique OK.')`)
+    await exec("alert('⚠️ Caixa não encontrada! Selecione manualmente.')")
   }
 
   await new Promise(r => setTimeout(r, 1000))
 
-  // Clica em Listar pra ver portas de atendimento
+  // Listar portas
   console.log('📋 Listando portas de atendimento...')
-  await waitFor('button')
-  await exec(`
-    (function() {
-      const btns = document.querySelectorAll('button')
-      const listar = Array.from(btns).find(b => b.textContent.trim() === 'Listar')
-      if (listar) listar.click()
-    })()
-  `)
+  await exec(
+    "(function() {" +
+    "  var btns = document.querySelectorAll('button');" +
+    "  var listar = Array.from(btns).find(function(b) { return b.textContent.trim() === 'Listar'; });" +
+    "  if (listar) listar.click();" +
+    "})()"
+  )
   await new Promise(r => setTimeout(r, 2000))
 
-  // Seleciona a primeira porta com status "Disponível" e captura o número
+  // Seleciona primeira porta Disponível
   console.log('🔍 Procurando porta disponível...')
-  let portaAtendimento = ''
-  const portaSelecionada = await (async () => {
-    const inicio = Date.now()
+  var portaAtendimento = ''
+  var portaSelecionada = await (async function() {
+    var inicio = Date.now()
     while (Date.now() - inicio < 10000) {
-      const result = await exec(`
-        (function() {
-          // Procura todas as linhas da tabela de portas
-          const rows = document.querySelectorAll('tbody tr')
-          for (const row of rows) {
-            const cells = row.querySelectorAll('td')
-            // Procura a célula com badge "Disponível"
-            const badge = row.querySelector('span.vg-badge-content')
-            if (badge && badge.textContent.trim() === 'Disponível') {
-              // Pega o número da porta (primeira coluna)
-              const porta = cells[0] ? cells[0].textContent.trim() : ''
-              // Clica pra selecionar
-              row.click()
-              return porta || 'disponível'
-            }
-          }
-          return ''
-        })()
-      `)
-      if (result.result?.value) {
+      var result = await exec(
+        "(function() {" +
+        "  var rows = document.querySelectorAll('tbody tr');" +
+        "  for (var j = 0; j < rows.length; j++) {" +
+        "    var row = rows[j];" +
+        "    var badge = row.querySelector('span.vg-badge-content');" +
+        "    if (badge && badge.textContent.trim() === 'Disponível') {" +
+        "      var cells = row.querySelectorAll('td');" +
+        "      var porta = cells[0] ? cells[0].textContent.trim() : '';" +
+        "      row.click();" +
+        "      return porta || 'disponível';" +
+        "    }" +
+        "  }" +
+        "  return '';" +
+        "})()"
+      )
+      if (result.result && result.result.value) {
         portaAtendimento = result.result.value
-        console.log('✅ Porta disponível encontrada:', portaAtendimento)
+        console.log('✅ Porta disponível:', portaAtendimento)
         return true
       }
       await new Promise(r => setTimeout(r, 300))
@@ -727,166 +595,140 @@ async function main() {
   })()
 
   if (!portaSelecionada) {
-    console.warn('⚠️ Nenhuma porta disponível encontrada!')
-    await exec(`alert('⚠️ Nenhuma porta disponível! Selecione manualmente e clique OK.')`)
+    await exec("alert('⚠️ Nenhuma porta disponível! Selecione manualmente.')")
   }
 
-  // Clica em Selecionar pra confirmar a porta
-  console.log('✅ Confirmando porta selecionada...')
-  await exec(`
-    (function() {
-      const btns = document.querySelectorAll('button')
-      const selecionar = Array.from(btns).find(b => b.textContent.trim() === 'Selecionar')
-      if (selecionar) selecionar.click()
-    })()
-  `)
+  // Confirmar porta
+  console.log('✅ Confirmando porta...')
+  await exec(
+    "(function() {" +
+    "  var btns = document.querySelectorAll('button');" +
+    "  var sel = Array.from(btns).find(function(b) { return b.textContent.trim() === 'Selecionar'; });" +
+    "  if (sel) sel.click();" +
+    "})()"
+  )
   await new Promise(r => setTimeout(r, 1000))
 
-  // ══════════════════════════════════════════
-  //  SALVAR LOGIN
-  // ══════════════════════════════════════════
+  // ── SALVAR LOGIN ──
 
   console.log('💾 Salvando login...')
-  await exec(`document.querySelector('button[type="submit"][title="Alt+S"]').click()`)
+  await exec("document.querySelector('button[type=\"submit\"][title=\"Alt+S\"]').click()")
 
-  console.log('⏳ Aguardando confirmação de salvo do login...')
-  const salvouLogin = await (async () => {
-    const inicio = Date.now()
-    while (Date.now() - inicio < 15000) {
-      const result = await exec(`
-        (function() {
-          const el = document.querySelector('div.notificationMessage span')
-          return el && el.innerText ? el.innerText.trim() : ''
-        })()
-      `)
-      if (result.result?.value) {
-        console.log('✅ Resposta IXC:', result.result.value)
-        return true
-      }
-      await new Promise(r => setTimeout(r, 300))
-    }
-    return false
-  })()
-
+  console.log('⏳ Aguardando confirmação do login...')
+  var salvouLogin = await waitForNotification(exec)
   if (!salvouLogin) {
     console.warn('⚠️ Não detectei confirmação do login — esperando 5s...')
     await new Promise(r => setTimeout(r, 5000))
   }
 
-  // ══════════════════════════════════════════
-  //  PARTE 5 — O.S.
-  // ══════════════════════════════════════════
+  // ── O.S. ──
 
-  // Aba O.S.
   console.log('📋 Abrindo aba O.S...')
-  await waitFor('a.tabTitle[rel="13"]')
-  await exec(`document.querySelector('a.tabTitle[rel="13"]').click()`)
+  await waitFor('a.tabTitle[rel=\"13\"]')
+  await exec("document.querySelector('a.tabTitle[rel=\"13\"]').click()")
   await new Promise(r => setTimeout(r, 1000))
 
-  // Clica em Nova
+  // Nova OS
   console.log('➕ Clicando em Nova O.S...')
-  await waitFor('button[name="novo"]')
-  await exec(`
-    (function() {
-      const btns = document.querySelectorAll('button[name="novo"]')
-      const btn = Array.from(btns).find(b => b.textContent.trim() === 'Nova')
-      if (btn) btn.click()
-    })()
-  `)
+  await waitFor('button[name=\"novo\"]')
+  await exec(
+    "(function() {" +
+    "  var btns = document.querySelectorAll('button[name=\"novo\"]');" +
+    "  var btn = Array.from(btns).find(function(b) { return b.textContent.trim() === 'Nova'; });" +
+    "  if (btn) btn.click();" +
+    "})()"
+  )
   await new Promise(r => setTimeout(r, 1500))
 
-  // Assunto (código do OPA)
-  const assuntoOS = '1' // TODO: vem do OPA
+  // Assunto
   console.log('📝 Preenchendo assunto da OS...')
   await waitFor('input#id_assunto')
-  await exec(`
-    (function() {
-      const input = document.querySelector('input#id_assunto')
-      input.value = '${assuntoOS}'
-      input.dispatchEvent(new Event('input', { bubbles: true }))
-      input.dispatchEvent(new Event('change', { bubbles: true }))
-      input.dispatchEvent(new KeyboardEvent('keydown', { keyCode: 13, bubbles: true }))
-    })()
-  `)
+  await exec("(function() { var i = document.querySelector('input#id_assunto'); i.value = '" + DADOS.assuntoOS + "'; i.dispatchEvent(new Event('input', {bubbles:true})); i.dispatchEvent(new Event('change', {bubbles:true})); i.dispatchEvent(new KeyboardEvent('keydown', {keyCode:13, bubbles:true})); })()")
   await new Promise(r => setTimeout(r, 500))
 
   // Setor — sempre 1
   console.log('📝 Preenchendo setor...')
-  await waitFor('input#id_assunto')  // setor pode ser outro seletor, ajustar se necessário
-  await exec(`
-    (function() {
-      // Tenta pelo seletor mais provável
-      const input = document.querySelector('input#id_setor') || document.querySelector('input[name="id_setor"]')
-      if (input) {
-        input.value = '1'
-        input.dispatchEvent(new Event('input', { bubbles: true }))
-        input.dispatchEvent(new Event('change', { bubbles: true }))
-        input.dispatchEvent(new KeyboardEvent('keydown', { keyCode: 13, bubbles: true }))
-      }
-    })()
-  `)
+  await exec("(function() { var i = document.querySelector('input#id_setor') || document.querySelector('input[name=\"id_setor\"]'); if (i) { i.value = '1'; i.dispatchEvent(new Event('input', {bubbles:true})); i.dispatchEvent(new Event('change', {bubbles:true})); i.dispatchEvent(new KeyboardEvent('keydown', {keyCode:13, bubbles:true})); } })()")
   await new Promise(r => setTimeout(r, 500))
 
-  // Descrição da OS — monta o texto com dados extraídos
-  // TODO: substituir pelos dados reais do OPA
-  const caixaOPA = 'TR012-12-14'       // vem do OPA
-  const metragemOPA = '50m'             // vem do OPA
-  const planoEscolhido = 'PLANO RENASCER FIDELIDADE: 570 MEGA 99,90' // vem do OPA
-  const vendaDia = '06/03/2026'         // vem do OPA
-  const agendadoPara = '07/03/2026'     // vem do OPA
-  const turno = 'MANHÃ'                 // vem do OPA
-
-  const descricaoOS = 'Vendedor: WILLIAN POERARI\n'
-    + 'Caixa / Metragem / Porta: ' + caixaOPA + ' - ' + metragemOPA + ' - P' + portaAtendimento + '\n'
-    + 'Plano Escolhido: ' + planoEscolhido + '\n'
+  // Descrição da OS
+  var descricaoOS = 'Vendedor: WILLIAN POERARI\n'
+    + 'Caixa / Metragem / Porta: ' + DADOS.cto + ' - ' + DADOS.distancia + ' - P' + portaAtendimento + '\n'
+    + 'Plano Escolhido: ' + DADOS.planoVendas + '\n'
     + 'Valor de Instalação no Ato: ISENTO\n'
-    + 'Venda no Dia: ' + vendaDia + '\n'
-    + 'Agendado Instalação Para: ' + agendadoPara + '\n'
-    + 'Turno: ' + turno
+    + 'Venda no Dia: ' + DADOS.vendaDia + '\n'
+    + 'Agendado Instalação Para: ' + DADOS.instalacaoDia + '\n'
+    + 'Turno: ' + DADOS.turno
 
   console.log('📝 Preenchendo descrição da OS...')
   await waitFor('textarea#mensagem')
-  await exec("(function() { const textarea = document.querySelector('textarea#mensagem'); textarea.value = " + JSON.stringify(descricaoOS) + "; textarea.dispatchEvent(new Event('input', { bubbles: true })); textarea.dispatchEvent(new Event('change', { bubbles: true })); })()")
+  await exec("(function() { var t = document.querySelector('textarea#mensagem'); t.value = " + JSON.stringify(descricaoOS) + "; t.dispatchEvent(new Event('input', {bubbles:true})); t.dispatchEvent(new Event('change', {bubbles:true})); })()")
   await new Promise(r => setTimeout(r, 500))
 
   // Salvar OS
   console.log('💾 Salvando OS...')
-  await exec(`document.querySelector('button[type="submit"][title="Alt+S"]').click()`)
+  await exec("document.querySelector('button[type=\"submit\"][title=\"Alt+S\"]').click()")
 
-  console.log('⏳ Aguardando confirmação de salvo da OS...')
-  const salvouOS = await (async () => {
-    const inicio = Date.now()
-    while (Date.now() - inicio < 15000) {
-      const result = await exec(`
-        (function() {
-          const el = document.querySelector('div.notificationMessage span')
-          return el && el.innerText ? el.innerText.trim() : ''
-        })()
-      `)
-      if (result.result?.value) {
-        console.log('✅ Resposta IXC:', result.result.value)
-        return true
-      }
-      await new Promise(r => setTimeout(r, 300))
-    }
-    return false
-  })()
-
+  console.log('⏳ Aguardando confirmação da OS...')
+  var salvouOS = await waitForNotification(exec)
   if (!salvouOS) {
     console.warn('⚠️ Não detectei confirmação da OS — esperando 5s...')
     await new Promise(r => setTimeout(r, 5000))
   }
 
   // Popup de sucesso
-  await exec(`alert('✅ CADASTRO COMPLETO!\\n\\nCliente cadastrado com sucesso!\\nContrato: ${numeroContrato}\\nPorta: P${portaAtendimento}\\nOS aberta e salva.')`)
+  await exec("alert('✅ CADASTRO COMPLETO!\\n\\nCliente: " + DADOS.nome + "\\nContrato: " + numeroContrato + "\\nPorta: P" + portaAtendimento + "\\nOS aberta e salva.')")
 
   console.log('══════════════════════════════════════')
   console.log('✅ FLUXO COMPLETO!')
+  console.log('📌 Cliente:', DADOS.nome)
   console.log('📌 Contrato:', numeroContrato)
   console.log('📌 Porta:', portaAtendimento)
   console.log('══════════════════════════════════════')
 
   await client.close()
+}
+
+// ── Helper: aguarda notificação do IXC ──
+
+async function waitForNotification(exec) {
+  // Limpa notificações antigas antes de esperar a nova
+  await exec("(function() { var els = document.querySelectorAll('div.notification-success'); els.forEach(function(e) { e.remove(); }); })()")
+  await new Promise(r => setTimeout(r, 300))
+
+  var inicio = Date.now()
+  while (Date.now() - inicio < 15000) {
+    var result = await exec("(function() { var el = document.querySelector('div.notification-success'); if (el) { var msg = el.querySelector('div.notificationMessage span'); return msg && msg.innerText ? msg.innerText.trim() : 'sucesso'; } return ''; })()")
+    if (result.result && result.result.value) {
+      console.log('✅ Resposta IXC:', result.result.value)
+      return true
+    }
+    await new Promise(r => setTimeout(r, 300))
+  }
+  return false
+}
+
+// ── MAIN ──
+
+async function main() {
+  console.log('══════════════════════════════════════')
+  console.log('🚀 AUTOMAÇÃO OPA → IXC')
+  console.log('══════════════════════════════════════')
+
+  // Fase 1: Extrai dados do OPA
+  var dados = await extrairDadosOPA()
+
+  console.log('══════════════════════════════════════')
+  console.log('📦 Dados extraídos do OPA:')
+  console.log('  Nome:', dados.nome)
+  console.log('  CPF:', dados.cpf)
+  console.log('  Plano:', dados.planoVendas)
+  console.log('  CTO:', dados.cto)
+  console.log('  Vencimento:', dados.vencimento)
+  console.log('══════════════════════════════════════')
+
+  // Fase 2: Cadastra no IXC
+  await cadastrarNoIXC(dados)
 }
 
 main()
